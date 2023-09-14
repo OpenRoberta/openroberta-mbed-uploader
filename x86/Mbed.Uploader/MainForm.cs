@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Security;
 using System.Threading;
 using System.Windows.Forms;
@@ -12,8 +13,14 @@ namespace Microsoft.MbedUploader
     internal partial class MainForm : Form
     {
         FileSystemWatcher watcher;
-        private string customcopypath = "";
-        private string downloads;
+        private String customcopypath = "";
+        private String downloads;
+        private String[] filetypes = { ".hex", ".uf2" };
+        static private List<KeyValuePair<String, String[]>> robots = new List<KeyValuePair<String, String[]>>()
+        {
+            new KeyValuePair<String, String[]>(".hex", new string[] {"MINI", "MICROBIT"}),
+            new KeyValuePair<String, String[]>(".uf2", new string[] {"EV3"})
+        };
 
         public MainForm()
         {
@@ -22,7 +29,7 @@ namespace Microsoft.MbedUploader
             this.versionLabel.Text = "v" + v.Major + "." + v.Minor;
         }
 
-        public void ReloadFileWatch(string path)
+        public void ReloadFileWatch(String path)
         {
             customcopypath = path;
             initializeFileWatch();
@@ -36,7 +43,7 @@ namespace Microsoft.MbedUploader
 
         private void initializeFileWatch()
         {
-            customcopypath = (string)Application.UserAppDataRegistry.GetValue("CustomDirectory", "");
+            customcopypath = (String)Application.UserAppDataRegistry.GetValue("CustomDirectory", "");
 
             if (!String.IsNullOrEmpty(customcopypath) && Directory.Exists(customcopypath))
             {
@@ -58,19 +65,19 @@ namespace Microsoft.MbedUploader
             this.watcher.Created += (sender, e) => this.handleFileEvent(e);
             this.watcher.EnableRaisingEvents = true;
 
-            this.waitingForHexFileStatus();
+            this.waitingForFileStatus();
         }
 
-        private void waitingForHexFileStatus()
+        private void waitingForFileStatus()
         {
-            this.updateStatus($"Warte auf .hex-Datei ...");
-            this.trayIcon.ShowBalloonTip(3000, "Bereit...", $"Warte auf .hex-Datei ...", ToolTipIcon.None);
+            this.updateStatus($"Warte auf Datei ...");
+            this.trayIcon.ShowBalloonTip(3000, "Bereit...", $"Warte auf Datei ...", ToolTipIcon.None);
             this.label1.Text = downloads;
         }
 
         delegate void Callback();
 
-        private void updateStatus(string value)
+        private void updateStatus(String value)
         {
             Callback a = (Callback)(() =>
             {
@@ -86,7 +93,7 @@ namespace Microsoft.MbedUploader
         }
 
         volatile int copying;
-        void handleFile(string fullPath)
+        void handleFile(String fullPath)
         {
             try
             {
@@ -94,45 +101,48 @@ namespace Microsoft.MbedUploader
                 // directly. This mean we may catch it in the act. Let's leave it some time to finish writing.
                 Thread.Sleep(500);
 
-                var info = new System.IO.FileInfo(fullPath);
+                var info = new FileInfo(fullPath);
                 Trace.WriteLine("download: " + info.FullName);
 
-                if (info.Extension != ".hex") return;
-
-                var infoName = info.Name;
+                if (!filetypes.Contains(info.Extension)) return;
                 Trace.WriteLine("download name: " + info.Name);
-                if (info.Name.EndsWith(".uploaded.hex", StringComparison.OrdinalIgnoreCase)) return;
-                if (info.Length > 10000000) return; // make sure we don't try to copy large files
-
-
+                if (info.Name.EndsWith(".uploaded" + info.Extension, StringComparison.OrdinalIgnoreCase)) return;
+                if (info.Extension.Equals(".hex") && info.Length > 10000000)
+                {
+                    this.updateStatus("Die " + info.Extension + "-Datei ist zu groß!");
+                    return; // make sure we don't try to copy large files
+                }
+                    
                 // already copying?
                 if (Interlocked.Exchange(ref this.copying, 1) == 1)
                     return;
 
                 try
                 {
-
-                    var driveletters = getCalliopeMiniDrives();
+                    var robotList = getRobotList(info.Extension);
+                    var driveletters = getDrives(robotList);
                     List<String> drives = new List<String>();
+                    
                     foreach (var d in driveletters)
                     {
                         drives.Add(d.RootDirectory.FullName);
                     }
                     if (drives.Count == 0)
                     {
-                        this.updateStatus("Kein Roboter gefunden");
-                        this.trayIcon.ShowBalloonTip(3000, "Kopieren abgebrochen...", "Kein mini gefunden", ToolTipIcon.None);
+                        this.updateStatus("Keinen Roboter gefunden");
+                        this.trayIcon.ShowBalloonTip(3000, "Kopieren abgebrochen...", "Keinen Roboter gefunden", ToolTipIcon.None);
                         return;
                     }
 
-                    this.updateStatus("kopiere .hex Datei");
-                    this.trayIcon.ShowBalloonTip(3000, "Kopiere...", "Kopiere .hex Datei", ToolTipIcon.None);
-
+                    var copy = "Kopiere " + info.Extension + "-Datei";
+                    this.updateStatus(copy);
+                    this.trayIcon.ShowBalloonTip(3000, "Kopiere...", copy, ToolTipIcon.None);
+                    
                     // copy to all boards
-                    copyFirmware(info.FullName, drives);
+                    copyFirmware(info, drives);
 
-                    // move away hex file
-                    var temp = System.IO.Path.ChangeExtension(info.FullName, ".uploaded.hex");
+                    // move away file
+                    var temp = Path.ChangeExtension(info.FullName, ".uploaded" + info.Extension);
                     try
                     {
                         File.Copy(info.FullName, temp, true);
@@ -145,7 +155,7 @@ namespace Microsoft.MbedUploader
 
                     // update ui
                     this.updateStatus("uploading done");
-                    this.waitingForHexFileStatus();
+                    this.waitingForFileStatus();
                 }
                 finally
                 {
@@ -158,20 +168,33 @@ namespace Microsoft.MbedUploader
             catch (ArgumentException) { }
         }
 
-        static void copyFirmware(string file, List<string> drives)
+        private String[] getRobotList(String extension)
+        {
+            foreach (var item in robots)
+            {
+                if (item.Key.StartsWith(extension, StringComparison.Ordinal))
+                {
+                    return item.Value;
+                }
+            }
+            return null;
+        }
+
+        static void copyFirmware(FileInfo file, List<String> drives)
         {
             var waitHandles = new List<WaitHandle>();
             foreach (var drive in drives)
             {
+
                 var ev = new AutoResetEvent(false);
                 waitHandles.Add(ev);
                 ThreadPool.QueueUserWorkItem((state) =>
                 {
                     try
                     {
-                        var trg = System.IO.Path.Combine(drive, "firmware.hex");
+                        var trg = Path.Combine(drive, "firmware" + file.Extension);
 
-                        var fs1 = new FileStream(file, FileMode.Open, FileAccess.Read);
+                        var fs1 = new FileStream(file.FullName, FileMode.Open, FileAccess.Read);
 
                         var fs2 = new FileStream(trg, FileMode.Create);
 
@@ -193,20 +216,20 @@ namespace Microsoft.MbedUploader
             WaitHandle.WaitAll(waitHandles.ToArray());
         }
 
-        static DriveInfo[] getCalliopeMiniDrives()
+        static DriveInfo[] getDrives(String[] robotList)
         {
-            var drives = System.IO.DriveInfo.GetDrives();
-            var r = new System.Collections.Generic.List<DriveInfo>();
+            var drives = DriveInfo.GetDrives();
+            var r = new List<DriveInfo>();
             foreach (var di in drives)
             {
                 var label = getVolumeLabel(di);
-                if (label.StartsWith("MINI", StringComparison.Ordinal) | label.StartsWith("MICROBIT", StringComparison.Ordinal))
+                if (robotList.Contains(label))
                     r.Add(di);
             }
             return r.ToArray();
         }
 
-        static string getVolumeLabel(DriveInfo di)
+        static String getVolumeLabel(DriveInfo di)
         {
             try { return di.VolumeLabel; }
             catch (IOException) { }
